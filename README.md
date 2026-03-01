@@ -2,8 +2,7 @@
 # oracle_arm
 oracle arm registration script. 乌龟壳刷ARM脚本
 
-![visitors](https://visitor-badge.glitch.me/badge?page_id=oracle_arm)
-
+- [x] gemini ai 优化,未测试(已氪，随便手开ARM，用不上就没测试)
 
 # 本脚本优点
 
@@ -140,7 +139,7 @@ USE_TG = False  # 如果启用tg推送 要设置为True
 TG_BOT_TOKEN = ''  # 通过 @BotFather 申请获得，示例：1077xxx4424:AAFjv0FcqxxxxxxgEMGfi22B4yh15R5uw
 TG_USER_ID = ''  # 用户、群组或频道 ID，示例：129xxx206 ,
 ```
-`USE_TG=True`
+将 `USE_TG = False` 修改为 `USE_TG = True`
 其他的token和id自行配置自己的,id可以点击这个[机器人](https://t.me/myidbot?start=botostore)获取
 
 开始推送和创建成功的推送demo:
@@ -172,18 +171,21 @@ pip3 install -r requirements.txt
 上传 `main.tf` 文件到 oracle_arm 目录
 
 首先运行一遍测试一下
-`python3 oracle_arm.py main.tf` 
-稍等一下看返回结果,如果显示`抢注中，xxxxx` 就说明脚本没有问题
+`python3 oracle_arm.py main.tf --dry-run` 
 
-
-`nohup python3 oracle_arm.py main.tf >> /dev/null 2>&1 &`
+稍等一下查看返回结果，如果出现“Dry run 模式”或正常进入尝试日志（如“第 1 次尝试”），说明脚本运行正常。
 
 如果想保存一个日志，可以运行下面这个命令运行:
 
-`nohup python3 oracle_arm.py main.tf  > oracle_arm.log 2>&1 &`
+```
+nohup python3 oracle_arm.py main.tf \
+  --disable-pwd \
+  --max-attempts 10000 \
+  --tg-token "123456:AA..." \
+  --tg-chat "987654321" > oracle_arm.log 2>&1 &
+```
 
-
-会自动停止的,不用管了。Done and enjoy 🎉
+满足最大尝试次数或超时条件后会自动停止，无需人工干预。Done.
 
 # 再次感谢
 
