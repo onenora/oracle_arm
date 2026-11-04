@@ -2,7 +2,7 @@
 # oracle_arm
 oracle arm registration script. 乌龟壳刷ARM脚本
 
-- [x] gemini ai 优化,未测试(已氪，随便手开ARM，用不上就没测试)
+- [x] 2026-11 重写（未在真实账号上实测）
 
 # 本脚本优点
 
@@ -130,17 +130,15 @@ sudo sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/s
 sudo service sshd restart
 ``` -->
 
-# 脚本需要改的地方
-## 启动 tg推送
+# Telegram 推送（可选）
 
-修改
-```python
-USE_TG = False  # 如果启用tg推送 要设置为True
-TG_BOT_TOKEN = ''  # 通过 @BotFather 申请获得，示例：1077xxx4424:AAFjv0FcqxxxxxxgEMGfi22B4yh15R5uw
-TG_USER_ID = ''  # 用户、群组或频道 ID，示例：129xxx206 ,
+通过 [@BotFather](https://t.me/BotFather) 申请 Bot Token，通过 [这个机器人](https://t.me/myidbot?start=botostore) 获取 Chat ID，用环境变量传入（避免出现在 `ps` 和 shell 历史里）：
+
+```shell
+export TG_BOT_TOKEN="1077xxx4424:AAFjv0Fc..."
+export TG_CHAT_ID="129xxx206"
+# 网络无法直连 Telegram 时可设置反代: export TG_API_HOST="tg.example.com"
 ```
-将 `USE_TG = False` 修改为 `USE_TG = True`
-其他的token和id自行配置自己的,id可以点击这个[机器人](https://t.me/myidbot?start=botostore)获取
 
 开始推送和创建成功的推送demo:
 
@@ -161,31 +159,42 @@ TG_USER_ID = ''  # 用户、群组或频道 ID，示例：129xxx206 ,
 
 # 运行脚本
 
-```
+```shell
 git clone https://github.com/n0thing2speak/oracle_arm
-
 cd oracle_arm
+```
+上传 `main.tf` 到 oracle_arm 目录，然后：
 
+```shell
+./run.sh                 # 自动建 venv、装依赖、先 dry-run 校验，再后台运行
+./run.sh --disable-pwd   # 不设 root 密码，仅用 main.tf 中的 SSH Key 登录
+tail -f oracle_arm.log   # 查看日志
+kill $(cat oracle_arm.pid)  # 停止
+```
+
+手动运行（需要 Python 3.10+；3.15 上 oci 依赖的 crc32c / python-pkcs11 暂无预编译包，需先 `apt install build-essential python3-dev`）：
+
+```shell
 pip3 install -r requirements.txt
-```
-上传 `main.tf` 文件到 oracle_arm 目录
-
-首先运行一遍测试一下
-`python3 oracle_arm.py main.tf --dry-run` 
-
-稍等一下查看返回结果，如果出现“Dry run 模式”或正常进入尝试日志（如“第 1 次尝试”），说明脚本运行正常。
-
-如果想保存一个日志，可以运行下面这个命令运行:
-
-```
-nohup python3 oracle_arm.py main.tf \
-  --disable-pwd \
-  --max-attempts 10000 \
-  --tg-token "123456:AA..." \
-  --tg-chat "987654321" > oracle_arm.log 2>&1 &
+python3 oracle_arm.py main.tf --dry-run   # 只读调用校验凭据、镜像、子网，不创建实例
+python3 oracle_arm.py main.tf             # 开刷
 ```
 
-满足最大尝试次数或超时条件后会自动停止，无需人工干预。Done.
+常用参数（`python3 oracle_arm.py -h` 查看全部）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--interval 10` | 基础请求间隔(秒)，遇 429 自动加倍、恢复后逐步回落 |
+| `--disable-pwd` | 不设置 root 密码 |
+| `--all-ads` | 轮询区域内所有可用域（Ashburn/Phoenix/Frankfurt 等多 AD 区域推荐） |
+| `--force` | 已有 `instance.json` 时仍继续抢 |
+| `--max-attempts` / `--timeout` | 最大尝试次数 / 最长运行小时数 |
+| `--oci-config` / `--profile` | 指定 OCI 配置文件与 profile |
+
+行为说明：
+- 容量不足 (`Out of host capacity`)、5xx、网络异常会持续重试；配额不足或参数错误会推送原因后退出。
+- 创建成功后立即推送实例 OCID 和 root 密码，再等待实例 RUNNING 后推送公网 IP；实例被回收也会推送。
+- 成功结果（实例 OCID、可用域、root 密码、公网 IP）写入 `instance.json`（权限 600）；该文件存在时脚本拒绝再次启动，防止重复开机。
 
 # 再次感谢
 

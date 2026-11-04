@@ -131,3 +131,7 @@ dmypy.json
 .vscode/
 .pycharm/
 .Ds_Store
+# oracle_arm
+main.tf
+*.pid
+instance.json

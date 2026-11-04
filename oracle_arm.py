@@ -1,436 +1,416 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+"""Oracle Cloud ARM (VM.Standard.A1.Flex) 实例抢注脚本。"""
 import argparse
 import base64
+import json
 import logging
+import os
 import random
 import re
 import secrets
+import shlex
 import signal
 import string
 import sys
 import threading
 import time
-from abc import ABC, abstractmethod
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, Type, Tuple
 
 import oci
-import requests
-from oci.core import ComputeClient, VirtualNetworkClient
-from oci.exceptions import ServiceError, RequestException, ConfigFileNotFound
+from oci.exceptions import ServiceError
 
-# ==========================================
-# 1. 异常模型层 (Exceptions)
-# ==========================================
-class OciSniperError(Exception): """基础异常类"""
-class ConfigurationError(OciSniperError): """配置解析异常"""
-class RateLimitError(OciSniperError): """API限速异常 (429)"""
-class CapacityError(OciSniperError): """资源不足异常 (500 Out of capacity)"""
-class QuotaError(OciSniperError): """配额耗尽异常 (400 Service limit)"""
-class FatalApiError(OciSniperError): """其他致命API异常"""
+SHAPE = "VM.Standard.A1.Flex"
+MAX_INTERVAL = 120.0
+RESULT_FILE = Path(__file__).with_name("instance.json")
 
-# ==========================================
-# 2. 配置与领域模型层 (Models & Config)
-# ==========================================
-@dataclass(frozen=True)
-class AppConfig:
-    max_attempts: int
-    global_timeout_hours: float
-    dry_run: bool
-    disable_root_password: bool
+log = logging.getLogger("oracle_arm")
+
+
+class ConfigError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# main.tf 解析
+# ---------------------------------------------------------------------------
+def _instance_block(text: str) -> str:
+    """截取 resource "oci_core_instance" 的块体，避免匹配到 VCN/子网等其他资源的同名字段。"""
+    m = re.search(r'resource\s+"oci_core_instance"\s+"[^"]*"\s*\{', text)
+    if not m:
+        return text
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return text[m.end():i - 1]
+
+
+def _top_level(block: str) -> str:
+    """去掉嵌套块，只保留块体顶层的属性。"""
+    out, depth = [], 0
+    for c in block:
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif depth == 0:
+            out.append(c)
+    return "".join(out)
+
+
+def _hostname_label(name: str) -> str:
+    label = re.sub(r"[^a-zA-Z0-9-]+", "-", name).strip("-")[:63].rstrip("-")
+    if not label or not label[0].isalpha():
+        label = ("arm-" + label)[:63].rstrip("-")
+    return label
+
 
 @dataclass(frozen=True)
 class TFConfig:
     compartment_id: str
-    memory_in_gbs: float
-    ocpus: float
     availability_domain: str
     subnet_id: str
     image_id: str
+    ocpus: float
+    memory_in_gbs: float
     display_name: str
-    boot_volume_size_in_gbs: float = 50.0
-    ssh_authorized_keys: str = ""
+    boot_volume_size_in_gbs: float
+    ssh_authorized_keys: str
+    assign_public_ip: bool
 
     @classmethod
     def from_file(cls, path: Path) -> "TFConfig":
-        if not path.exists():
-            raise ConfigurationError(f"Terraform 文件不存在: {path}")
-        
-        content = path.read_text(encoding="utf-8")
-        
-        def extract(pattern: str, default: Optional[str] = None, required: bool = True) -> str:
-            if match := re.search(pattern, content):
-                return match.group(1).strip()
-            if default is not None or not required:
-                return default or ""
-            raise ConfigurationError(f"解析失败: 缺少必须参数正则匹配 '{pattern}'")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            raise ConfigError(f"读取 {path} 失败: {e}") from e
+
+        block = _instance_block(text)
+        top = _top_level(block)
+
+        def find(src: str, key: str, quoted: bool = True) -> str | None:
+            pat = rf'"?\b{key}"?\s*=\s*"([^"]*)"' if quoted else rf'\b{key}\s*=\s*"?([\d.]+)"?'
+            m = re.search(pat, src)
+            return m.group(1).strip() if m else None
+
+        def require(value: str | None, key: str, ocid: bool = False) -> str:
+            if not value:
+                raise ConfigError(f"main.tf 中缺少 {key}")
+            if ocid and not value.startswith("ocid1."):
+                raise ConfigError(f"{key} 不是 OCID: {value!r}（创建实例时请选择已有 VCN/子网再导出堆栈）")
+            return value
+
+        def number(key: str, default: float | None = None) -> float:
+            raw = find(block, key, quoted=False)
+            if raw is None:
+                if default is None:
+                    raise ConfigError(f"main.tf 中缺少 {key}")
+                return default
+            return float(raw)
 
         return cls(
-            compartment_id=extract(r'compartment_id\s*=\s*"(.*?)"'),
-            memory_in_gbs=float(extract(r'memory_in_gbs\s*=\s*"(.*?)"')),
-            ocpus=float(extract(r'ocpus\s*=\s*"(.*?)"')),
-            availability_domain=extract(r'availability_domain\s*=\s*"(.*?)"'),
-            subnet_id=extract(r'subnet_id\s*=\s*"(.*?)"'),
-            image_id=extract(r'source_id\s*=\s*"(.*?)"'),
-            display_name=extract(r'display_name\s*=\s*"(.*?)"', default="Oracle-ARM-Auto"),
-            boot_volume_size_in_gbs=float(extract(r'boot_volume_size_in_gbs\s*=\s*"(.*?)"', default="50.0")),
-            ssh_authorized_keys=extract(r'"ssh_authorized_keys"\s*=\s*"(.*?)"', required=False)
+            compartment_id=require(find(top, "compartment_id"), "compartment_id", ocid=True),
+            availability_domain=require(find(top, "availability_domain"), "availability_domain"),
+            subnet_id=require(find(block, "subnet_id"), "subnet_id", ocid=True),
+            image_id=require(find(block, "source_id"), "source_id", ocid=True),
+            ocpus=number("ocpus"),
+            memory_in_gbs=number("memory_in_gbs"),
+            display_name=find(top, "display_name") or "oracle-arm",
+            boot_volume_size_in_gbs=number("boot_volume_size_in_gbs", 50.0),
+            ssh_authorized_keys=find(block, "ssh_authorized_keys") or "",
+            assign_public_ip=(find(block, "assign_public_ip") or "true").lower() != "false",
         )
 
-# ==========================================
-# 3. 通知服务层 (Notifiers)
-# ==========================================
-class Notifier(ABC):
-    @abstractmethod
-    def send(self, message: str) -> None:
-        pass
 
-class TelegramNotifier(Notifier):
+# ---------------------------------------------------------------------------
+# 通知
+# ---------------------------------------------------------------------------
+class Telegram:
     def __init__(self, token: str, chat_id: str, api_host: str = "api.telegram.org"):
-        self.token = token
+        self.enabled = bool(token and chat_id)
         self.chat_id = chat_id
-        self.api_url = f"https://{api_host}/bot{token}/sendMessage"
+        self.url = f"https://{api_host}/bot{token}/sendMessage"
 
-    def send(self, message: str) -> None:
-        if not self.token or not self.chat_id:
+    def send(self, text: str) -> None:
+        if not self.enabled:
             return
-        payload = {'chat_id': self.chat_id, 'text': f'🐢 [OCI Sniper] 播报 🐢\n\n{message}'}
-        try:
-            # 独立重试与超时控制，不影响主流程
-            requests.post(self.api_url, data=payload, timeout=10)
-        except requests.RequestException as e:
-            logging.warning(f"通知发送失败 (Network/Timeout): {e}")
+        body = json.dumps({"chat_id": self.chat_id, "text": f"🐢 甲骨文 ARM 抢注播报 🐢\n\n{text}"}).encode()
+        req = urllib.request.Request(self.url, data=body, headers={"Content-Type": "application/json"})
+        for i in range(3):
+            try:
+                urllib.request.urlopen(req, timeout=10).close()
+                return
+            except urllib.error.HTTPError as e:
+                log.warning("Telegram 推送失败: HTTP %s %s", e.code, e.read()[:200].decode(errors="replace"))
+                return
+            except OSError as e:
+                # 只打印类型，避免把含 token 的 URL 写进日志
+                log.warning("Telegram 推送网络异常 (%s)，第 %d 次", type(e).__name__, i + 1)
+                time.sleep(2)
 
-class CompositeNotifier(Notifier):
-    """组合模式：支持同时推送到多个渠道"""
-    def __init__(self, notifiers: list[Notifier]):
-        self.notifiers = notifiers
-        
-    def send(self, message: str) -> None:
-        for n in self.notifiers:
-            n.send(message)
 
-# ==========================================
-# 4. 基础设施与重试工具 (Infrastructure & Utils)
-# ==========================================
-def retry_on_network_error(max_retries: int = 3, backoff_factor: float = 2.0):
-    """专门用于处理网络抖动和DNS解析失败的装饰器"""
-    def decorator(func):
-        def wrapper(*args, **kwargs):
-            attempt = 0
-            while attempt < max_retries:
-                try:
-                    return func(*args, **kwargs)
-                except (requests.RequestException, RequestException) as e:
-                    attempt += 1
-                    sleep_t = backoff_factor ** attempt + random.uniform(0, 1)
-                    logging.warning(f"网络异常 ({e.__class__.__name__})，{sleep_t:.1f}秒后进行第 {attempt} 次重试...")
-                    time.sleep(sleep_t)
-                    if attempt >= max_retries:
-                        raise NetworkError(f"网络请求失败，已重试 {max_retries} 次: {e}") from e
-        return wrapper
-    return decorator
-
-def generate_secure_password(length: int = 16) -> str:
-    """使用 secrets 替代 random，满足安全审计要求"""
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
+# ---------------------------------------------------------------------------
+# cloud-init
+# ---------------------------------------------------------------------------
+def gen_password(length: int = 16) -> str:
+    alphabet = string.ascii_letters + string.digits
     while True:
-        pwd = ''.join(secrets.choice(alphabet) for _ in range(length))
-        if (any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and 
-            sum(c.isdigit() for c in pwd) >= 3):
+        pwd = "".join(secrets.choice(alphabet) for _ in range(length))
+        if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd):
             return pwd
 
-# ==========================================
-# 5. OCI 服务层 (Service Layer)
-# ==========================================
-class InstanceService:
-    def __init__(self, config_path: str, profile: str = "DEFAULT"):
-        try:
-            self.oci_cfg = oci.config.from_file(file_location=config_path, profile_name=profile)
-            oci.config.validate_config(self.oci_cfg)
-            self.compute_client = ComputeClient(config=self.oci_cfg)
-            self.network_client = VirtualNetworkClient(config=self.oci_cfg)
-        except ConfigFileNotFound as e:
-            raise ConfigurationError(f"OCI 配置文件错误: {e}")
 
-    def _parse_oci_error(self, e: ServiceError) -> type[OciSniperError]:
-        """将底层 OCI 错误映射为领域异常"""
-        if e.status == 429 or e.code == 'TooManyRequests':
-            return RateLimitError
-        if e.status == 500 and e.code == 'InternalError' and 'Out of host capacity' in e.message:
-            return CapacityError
-        if e.status == 400 and 'Service limit' in e.message:
-            return QuotaError
-        return FatalApiError
+def build_user_data(root_password: str) -> str:
+    # Ubuntu 22.04+ 的 /etc/ssh/sshd_config.d/*-cloudimg-settings.conf 会把 PasswordAuthentication 设为 no，
+    # sshd 取首次出现的值，所以写一个排序最靠前的 00- 文件覆盖；同时改主配置兼容没有 Include 的系统。
+    script = f"""#!/bin/bash
+echo {shlex.quote('root:' + root_password)} | chpasswd
+mkdir -p /etc/ssh/sshd_config.d
+printf 'PermitRootLogin yes\\nPasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/00-oracle-arm.conf
+sed -i -E 's/^#?[[:space:]]*PermitRootLogin.*/PermitRootLogin yes/; s/^#?[[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+systemctl restart ssh 2>/dev/null || systemctl restart sshd
+"""
+    return base64.b64encode(script.encode()).decode()
 
-    @retry_on_network_error(max_retries=3)
-    def launch(self, tf: TFConfig, user_data_b64: str, dry_run: bool = False) -> Optional[Any]:
-        """发起创建实例请求"""
-        # 严格区分 metadata (放SSH Key等短字符) 与 extended_metadata (放Cloud-Init等大对象)
-        metadata = {}
-        if tf.ssh_authorized_keys:
-            metadata['ssh_authorized_keys'] = tf.ssh_authorized_keys
 
-        details = oci.core.models.LaunchInstanceDetails(
-            display_name=tf.display_name,
-            compartment_id=tf.compartment_id,
-            shape="VM.Standard.A1.Flex",
-            shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
-                ocpus=tf.ocpus, memory_in_gbs=tf.memory_in_gbs
-            ),
-            availability_domain=tf.availability_domain,
-            create_vnic_details=oci.core.models.CreateVnicDetails(
-                subnet_id=tf.subnet_id, hostname_label=tf.display_name
-            ),
-            source_details=oci.core.models.InstanceSourceViaImageDetails(
-                image_id=tf.image_id, boot_volume_size_in_gbs=tf.boot_volume_size_in_gbs,
-            ),
-            metadata=metadata,
-            extended_metadata={'user_data': user_data_b64},
-            is_pv_encryption_in_transit_enabled=True,
-        )
+# ---------------------------------------------------------------------------
+# OCI
+# ---------------------------------------------------------------------------
+class OCI:
+    def __init__(self, config_file: str, profile: str):
+        cfg = oci.config.from_file(file_location=config_file, profile_name=profile)
+        oci.config.validate_config(cfg)
+        self.compute = oci.core.ComputeClient(cfg)
+        self.network = oci.core.VirtualNetworkClient(cfg)
+        self.identity = oci.identity.IdentityClient(cfg)
 
-        if dry_run:
-            logging.info(f"[Dry Run] 模拟调用创建 API: 负载校验通过。")
-            return None
+    def availability_domains(self, compartment_id: str) -> list[str]:
+        return [ad.name for ad in self.identity.list_availability_domains(compartment_id).data]
 
-        try:
-            return self.compute_client.launch_instance(details).data
-        except ServiceError as e:
-            raise self._parse_oci_error(e)(f"[{e.status} {e.code}] {e.message}") from e
+    def check(self, tf: TFConfig) -> None:
+        """只读调用，验证凭据与镜像/子网 OCID。"""
+        image = self.compute.get_image(tf.image_id).data
+        subnet = self.network.get_subnet(tf.subnet_id).data
+        log.info("凭据有效 | 镜像: %s | 子网: %s", image.display_name, subnet.display_name)
 
-    @retry_on_network_error(max_retries=5)
-    def get_public_ip(self, compartment_id: str, instance_id: str) -> Optional[str]:
-        attachments = self.compute_client.list_vnic_attachments(
-            compartment_id=compartment_id, instance_id=instance_id
+    def launch(self, details, retry_token: str):
+        # 关闭 SDK 默认重试：否则 500 Out of host capacity 会在 SDK 内部重试数分钟，节奏由脚本自己控制。
+        return self.compute.launch_instance(
+            details, opc_retry_token=retry_token, retry_strategy=oci.retry.NoneRetryStrategy()
         ).data
-        if attachments and attachments[0].vnic_id:
-            vnic = self.network_client.get_vnic(attachments[0].vnic_id).data
-            return vnic.public_ip
+
+    def instance_state(self, instance_id: str) -> str:
+        return self.compute.get_instance(instance_id).data.lifecycle_state
+
+    def public_ip(self, compartment_id: str, instance_id: str) -> str | None:
+        for att in self.compute.list_vnic_attachments(compartment_id=compartment_id, instance_id=instance_id).data:
+            if att.vnic_id:
+                ip = self.network.get_vnic(att.vnic_id).data.public_ip
+                if ip:
+                    return ip
         return None
 
-# ==========================================
-# 6. 核心调度与控制层 (Application Controller)
-# ==========================================
-class SniperController:
-    """负责状态机调度、退避算法和信号处理"""
-    def __init__(self, app_config: AppConfig, tf_config: TFConfig, 
-                 service: InstanceService, notifier: Notifier):
-        self.app_cfg = app_config
-        self.tf = tf_config
-        self.service = service
-        self.notifier = notifier
-        
-        self.shutdown_event = threading.Event()
-        self.start_time = time.time()
-        self.attempts = 0
-        
-        self._setup_signal_handlers()
 
-    def _setup_signal_handlers(self):
-        """优雅退出处理 (SIGINT/SIGTERM)"""
-        def handler(signum, frame):
-            logging.warning(f"接收到退出信号 ({signum})，准备优雅停机...")
-            self.shutdown_event.set()
-        signal.signal(signal.SIGINT, handler)
-        signal.signal(signal.SIGTERM, handler)
-
-    def _calculate_backoff(self, base: float = 8.0, max_backoff: float = 60.0, is_rate_limit: bool = False) -> float:
-        """带有 Jitter（抖动）的指数退避算法，避免集群雪崩请求"""
-        if is_rate_limit:
-            # 遇到 429 时，基础惩罚时间更长
-            base = max(base, 20.0)
-            
-        # 指数增长并用 max_backoff 截断
-        sleep_time = min(max_backoff, base * (1.2 ** self.attempts))
-        # 增加 10% ~ 30% 的抖动
-        jitter = random.uniform(0.1 * sleep_time, 0.3 * sleep_time)
-        return sleep_time + jitter
-
-    def _generate_cloud_init(self) -> Tuple[str, Optional[str]]:
-        """生成初始化脚本，返回 (base64_payload, plaintext_password)"""
-        pwd = None
-        bash_cmds = ["#!/bin/bash"]
-        
-        if self.app_cfg.disable_root_password:
-            bash_cmds.append("sudo sed -i 's/^.*PermitRootLogin.*/PermitRootLogin prohibit-password/g' /etc/ssh/sshd_config;")
-        else:
-            pwd = generate_secure_password()
-            bash_cmds.append(f"echo root:{pwd} | sudo chpasswd root")
-            bash_cmds.append("sudo sed -i 's/^.*PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config;")
-            bash_cmds.append("sudo sed -i 's/^.*PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config;")
-            
-        bash_cmds.append("sudo systemctl restart sshd")
-        script = "\n".join(bash_cmds)
-        return base64.b64encode(script.encode('utf-8')).decode('utf-8'), pwd
-
-    def run(self):
-        cloud_init_b64, root_pwd = self._generate_cloud_init()
-        
-        start_msg = (
-            f"🚀 [OCI Sniper 启动]\n"
-            f"区域: {self.tf.availability_domain}\n"
-            f"配置: {self.tf.ocpus}C | {self.tf.memory_in_gbs}G | {self.tf.boot_volume_size_in_gbs}G\n"
-            f"最大尝试: {self.app_cfg.max_attempts} 次 | Dry-Run: {self.app_cfg.dry_run}"
-        )
-        logging.info(start_msg.replace('\n', ' '))
-        self.notifier.send(start_msg)
-
-        while not self.shutdown_event.is_set():
-            self.attempts += 1
-            elapsed_hours = (time.time() - self.start_time) / 3600
-            
-            # 全局熔断检查
-            if self.attempts > self.app_cfg.max_attempts:
-                logging.error("达到最大尝试次数限制，退出任务。")
-                break
-            if elapsed_hours > self.app_cfg.global_timeout_hours:
-                logging.error(f"达到最大运行时间限制 ({self.app_cfg.global_timeout_hours}h)，退出任务。")
-                break
-
-            try:
-                instance = self.service.launch(self.tf, cloud_init_b64, self.app_cfg.dry_run)
-                
-                if self.app_cfg.dry_run:
-                    logging.info("Dry-Run 模式执行完毕。")
-                    break
-
-                self._on_success(instance, root_pwd)
-                break
-
-            except CapacityError as e:
-                backoff = self._calculate_backoff(base=5.0)
-                logging.info(f"第 {self.attempts} 次尝试: 容量不足 (Out of capacity)。休眠 {backoff:.1f}s...")
-                # 使用 Event.wait() 替代 time.sleep()，实现可随时响应 SIGINT 的中断休眠
-                self.shutdown_event.wait(timeout=backoff)
-
-            except RateLimitError as e:
-                backoff = self._calculate_backoff(base=20.0, is_rate_limit=True)
-                logging.warning(f"第 {self.attempts} 次尝试: 触发 API 限速 (429)。强退避 {backoff:.1f}s...")
-                self.shutdown_event.wait(timeout=backoff)
-
-            except QuotaError as e:
-                msg = f"❌ 严重错误: 您的租户配额不足 (Service Limit)。程序终止。\n详细信息: {e}"
-                logging.error(msg)
-                self.notifier.send(msg)
-                sys.exit(1) # 此处为顶层控制，允许退出
-
-            except FatalApiError as e:
-                logging.error(f"❌ 发生不可恢复的 API 错误: {e}")
-                self.notifier.send(f"脚本因 API 错误异常终止:\n{e}")
-                sys.exit(1)
-                
-            except NetworkError as e:
-                logging.error(f"⚠️ 核心网络错误: {e}")
-                self.shutdown_event.wait(timeout=10.0)
-
-        # 循环结束检查，如果是被中断的发送最后通知
-        if self.shutdown_event.is_set():
-            msg = f"🛑 任务已被手动/系统终止 (SIGTERM/SIGINT)。总计尝试: {self.attempts} 次，耗时: {elapsed_hours:.2f} 小时。"
-            logging.info(msg)
-            self.notifier.send(msg)
-
-    def _on_success(self, instance, root_pwd: Optional[str]):
-        """处理创建成功的逻辑：获取IP并通知"""
-        logging.info("🎉 实例创建 API 调用成功，正在等待分配公网 IP...")
-        
-        public_ip = None
-        # 等待最多 5 分钟获取 IP
-        for _ in range(30):
-            if self.shutdown_event.is_set():
-                break
-            public_ip = self.service.get_public_ip(self.tf.compartment_id, instance.id)
-            if public_ip:
-                break
-            self.shutdown_event.wait(10.0)
-
-        msg = (
-            f"🎉 **甲骨文 ARM 创建成功！** 🎉\n"
-            f"尝试次数: {self.attempts}\n"
-            f"区域: {self.tf.availability_domain}\n"
-            f"公网 IP: {public_ip or '获取超时，请登录控制台查看'}\n"
-        )
-        if root_pwd:
-            # 建议真实环境中，密码不要直接推送到明文频道，或者加密发送
-            msg += f"🔑 临时 Root 密码: {root_pwd}\n(建议登录后立即修改或禁用密码登录)"
-            # 在控制台仅打印脱敏密码
-            logging.info(f"分配密码: {root_pwd[:3]}***{root_pwd[-3:]}")
-        else:
-            msg += f"🔑 登录方式: 仅允许 SSH Key 登录"
-
-        logging.info(msg.replace('\n', ' '))
-        self.notifier.send(msg)
-
-
-# ==========================================
-# 7. 主程序入口 (CLI)
-# ==========================================
-def setup_logging(debug: bool = False):
-    level = logging.DEBUG if debug else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler("oci_sniper.log", encoding="utf-8")
-        ]
+def build_launch_details(tf: TFConfig, ad: str, user_data: str | None):
+    metadata = {}
+    if tf.ssh_authorized_keys:
+        metadata["ssh_authorized_keys"] = tf.ssh_authorized_keys
+    if user_data:
+        metadata["user_data"] = user_data
+    m = oci.core.models
+    return m.LaunchInstanceDetails(
+        display_name=tf.display_name,
+        compartment_id=tf.compartment_id,
+        availability_domain=ad,
+        shape=SHAPE,
+        shape_config=m.LaunchInstanceShapeConfigDetails(ocpus=tf.ocpus, memory_in_gbs=tf.memory_in_gbs),
+        create_vnic_details=m.CreateVnicDetails(subnet_id=tf.subnet_id, assign_public_ip=tf.assign_public_ip,
+                                                hostname_label=_hostname_label(tf.display_name)),
+        source_details=m.InstanceSourceViaImageDetails(image_id=tf.image_id,
+                                                       boot_volume_size_in_gbs=tf.boot_volume_size_in_gbs),
+        metadata=metadata,
+        is_pv_encryption_in_transit_enabled=True,
     )
 
-def main():
-    parser = argparse.ArgumentParser(description="🚀 Oracle ARM 实例抢注工具")
-    parser.add_argument("tf_file", type=Path, help="Terraform main.tf 配置文件路径")
-    parser.add_argument("--dry-run", action="store_true", help="不实际发起创建请求，仅测试链路")
-    parser.add_argument("--max-attempts", type=int, default=100000, help="最大尝试次数 (默认: 100000)")
-    parser.add_argument("--timeout", type=float, default=168.0, help="全局最大运行时间(小时) (默认: 168h/7天)")
-    parser.add_argument("--disable-pwd", action="store_true", help="禁用 Root 密码登录，强制仅使用 SSH Key")
-    parser.add_argument("--debug", action="store_true", help="开启 Debug 级别日志")
-    
-    # 隐藏的 TG 环境变量读取方式，避免在代码中硬编码
-    parser.add_argument("--tg-token", type=str, default="", help="Telegram Bot Token")
-    parser.add_argument("--tg-chat", type=str, default="", help="Telegram Chat ID")
 
-    args = parser.parse_args()
-    setup_logging(args.debug)
+def classify(e: ServiceError) -> str:
+    msg = (e.message or "").lower()
+    if e.status == 429:
+        return "ratelimit"
+    if e.status >= 500 or e.status == 409 or "capacity" in msg:
+        return "retry"
+    if e.code in ("LimitExceeded", "QuotaExceeded") or "limit" in msg or "quota" in msg:
+        return "quota"
+    return "fatal"
+
+
+# ---------------------------------------------------------------------------
+# 主循环
+# ---------------------------------------------------------------------------
+class Sniper:
+    def __init__(self, args, tf: TFConfig, api: OCI, tg: Telegram):
+        self.args, self.tf, self.api, self.tg = args, tf, api, tg
+        self.stop = threading.Event()
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
+
+    def _on_signal(self, signum, _frame):
+        log.warning("收到信号 %s，准备退出", signum)
+        self.stop.set()
+
+    def notify(self, text: str, level: int = logging.INFO) -> None:
+        log.log(level, text.replace("\n", " | "))
+        self.tg.send(text)
+
+    def run(self) -> int:
+        tf, args = self.tf, self.args
+        password = None if args.disable_pwd else gen_password()
+        user_data = build_user_data(password) if password else None
+        ads = [tf.availability_domain]
+        if args.all_ads:
+            # main.tf 里的可用域排第一，其余按区域顺序轮询
+            ads += [ad for ad in self.api.availability_domains(tf.compartment_id) if ad != tf.availability_domain]
+        details = [(ad, build_launch_details(tf, ad, user_data)) for ad in ads]
+
+        self.notify(f"启动\n可用域: {', '.join(ads)}\n实例: {tf.display_name}\n"
+                    f"配置: {tf.ocpus:g}C / {tf.memory_in_gbs:g}G / {tf.boot_volume_size_in_gbs:g}G\n"
+                    f"登录: {'仅 SSH Key' if args.disable_pwd else 'root 密码 + SSH Key'}")
+
+        if args.dry_run:
+            self.api.check(tf)
+            log.info("Dry-run 完成，未发起创建请求")
+            return 0
+
+        start, attempts, interval, token, idx = time.time(), 0, args.interval, None, 0
+        while not self.stop.is_set():
+            if attempts >= args.max_attempts or time.time() - start > args.timeout * 3600:
+                self.notify(f"达到上限（{attempts} 次 / {(time.time() - start) / 3600:.1f}h），未抢到，退出",
+                            logging.WARNING)
+                return 1
+            attempts += 1
+            token = token or uuid.uuid4().hex
+            ad, launch_details = details[idx]
+            try:
+                instance = self.api.launch(launch_details, token)
+            except ServiceError as e:
+                token = None  # 服务端已处理该请求，下次换 token、换可用域
+                idx = (idx + 1) % len(details)
+                kind = classify(e)
+                detail = f"[{ad}] {e.status} {e.code}: {e.message}"
+                if kind == "ratelimit":
+                    interval = min(interval * 2, MAX_INTERVAL)
+                    log.warning("第 %d 次: 限速 (429)，间隔调至 %.0fs", attempts, interval)
+                elif kind == "retry":
+                    interval = max(args.interval, interval * 0.8)
+                    log.info("第 %d 次: %s", attempts, detail)
+                elif kind == "quota":
+                    self.notify(f"❌ 配额不足，脚本停止。请到控制台检查是否已有实例或 CPU/内存/硬盘已被占用。\n{detail}",
+                                logging.ERROR)
+                    return 1
+                else:
+                    self.notify(f"❌ 不可恢复的错误，脚本停止。请检查 main.tf 与 OCI 配置。\n{detail}", logging.ERROR)
+                    return 1
+            except Exception as e:  # 网络/超时等：保留 token 重试，防止请求已生效却丢了响应导致重复创建
+                log.warning("第 %d 次: 网络异常 %s: %s", attempts, type(e).__name__, e)
+            else:
+                self.on_success(instance, ad, attempts, password)
+                return 0
+            self.stop.wait(interval * random.uniform(0.8, 1.2))
+
+        self.notify(f"🛑 手动停止，共尝试 {attempts} 次", logging.WARNING)
+        return 130
+
+    def on_success(self, instance, ad: str, attempts: int, password: str | None) -> None:
+        # 先落盘、推送，后续查询 IP 出任何问题都不会丢失密码
+        record = {"instance_id": instance.id, "availability_domain": ad, "root_password": password,
+                  "public_ip": None, "created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self.save(record)
+        self.notify(f"🎉 第 {attempts} 次尝试创建成功\n可用域: {ad}\n实例 OCID: {instance.id}\n"
+                    + (f"root 密码: {password}" if password else "登录方式: 仅 SSH Key"))
+
+        ip, state = None, instance.lifecycle_state
+        deadline = time.time() + 600
+        while time.time() < deadline and not self.stop.is_set():
+            try:
+                state = self.api.instance_state(instance.id)
+                if state in ("TERMINATING", "TERMINATED"):
+                    self.notify(f"⚠️ 实例被回收 ({state})，请重新运行脚本", logging.ERROR)
+                    return
+                if state == "RUNNING":
+                    ip = self.api.public_ip(self.tf.compartment_id, instance.id)
+                    if ip:
+                        break
+            except Exception as e:
+                log.warning("查询实例状态失败 %s: %s", type(e).__name__, e)
+            self.stop.wait(10)
+
+        if ip:
+            self.save(record | {"public_ip": ip})
+            self.notify(f"✅ 实例已运行\n公网 IP: {ip}\nssh root@{ip}" if password else
+                        f"✅ 实例已运行\n公网 IP: {ip}\nssh -i <私钥> ubuntu@{ip}（用户名视镜像而定）")
+        else:
+            self.notify(f"实例状态: {state}，10 分钟内未获取到公网 IP，请到控制台查看", logging.WARNING)
+
+
+    @staticmethod
+    def save(record: dict) -> None:
+        try:
+            RESULT_FILE.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            RESULT_FILE.chmod(0o600)
+        except OSError as e:
+            log.error("写入 %s 失败: %s", RESULT_FILE, e)
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description="Oracle ARM 实例抢注脚本")
+    p.add_argument("tf_file", type=Path, help="从堆栈导出的 main.tf")
+    p.add_argument("--dry-run", action="store_true", help="只校验配置与凭据，不创建实例")
+    p.add_argument("--disable-pwd", action="store_true", help="不设置 root 密码，仅用 main.tf 里的 SSH Key 登录")
+    p.add_argument("--all-ads", action="store_true", help="轮询区域内所有可用域（多 AD 区域如 Ashburn/Phoenix/Frankfurt）")
+    p.add_argument("--force", action="store_true", help=f"忽略已存在的 {RESULT_FILE.name} 继续抢")
+    p.add_argument("--interval", type=float, default=10.0, help="基础请求间隔秒数，遇 429 自动加倍 (默认 10)")
+    p.add_argument("--max-attempts", type=int, default=1_000_000, help="最大尝试次数")
+    p.add_argument("--timeout", type=float, default=24 * 30, help="最长运行小时数 (默认 720)")
+    p.add_argument("--oci-config", default="~/.oci/config", help="OCI 配置文件路径")
+    p.add_argument("--profile", default="DEFAULT", help="OCI 配置 profile")
+    p.add_argument("--tg-token", default=os.environ.get("TG_BOT_TOKEN", ""), help="Telegram Bot Token，或用环境变量 TG_BOT_TOKEN")
+    p.add_argument("--tg-chat", default=os.environ.get("TG_CHAT_ID", ""), help="Telegram Chat ID，或用环境变量 TG_CHAT_ID")
+    p.add_argument("--tg-api-host", default=os.environ.get("TG_API_HOST", "api.telegram.org"), help="Telegram API 反代域名")
+    p.add_argument("--debug", action="store_true")
+    args = p.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s", stream=sys.stdout)
+
+    if RESULT_FILE.exists() and not args.force and not args.dry_run:
+        log.error("%s 已存在，说明之前已抢到实例。确认要再抢一台请删除该文件或加 --force", RESULT_FILE)
+        return 2
 
     try:
-        # 组装配置
-        app_cfg = AppConfig(
-            max_attempts=args.max_attempts,
-            global_timeout_hours=args.timeout,
-            dry_run=args.dry_run,
-            disable_root_password=args.disable_pwd
-        )
-        tf_cfg = TFConfig.from_file(args.tf_file)
+        tf = TFConfig.from_file(args.tf_file)
+        if args.disable_pwd and not tf.ssh_authorized_keys:
+            raise ConfigError("--disable-pwd 需要 main.tf 中包含 ssh_authorized_keys，否则创建后无法登录")
+        if not tf.ssh_authorized_keys:
+            log.warning("main.tf 中没有 SSH 公钥，只能用 root 密码登录")
+        api = OCI(args.oci_config, args.profile)
+    except (ConfigError, oci.exceptions.ClientError) as e:
+        log.error("初始化失败: %s", e)
+        return 2
 
-        # 依赖注入 (DI)
-        notifiers = []
-        if args.tg_token and args.tg_chat:
-            notifiers.append(TelegramNotifier(args.tg_token, args.tg_chat))
-        else:
-            logging.warning("未配置 Telegram 参数，将静默运行，仅输出本地日志。")
-            
-        composite_notifier = CompositeNotifier(notifiers)
-        oci_service = InstanceService("~/.oci/config")
+    tg = Telegram(args.tg_token, args.tg_chat, args.tg_api_host)
+    if not tg.enabled:
+        log.warning("未配置 Telegram，结果只写入日志和 %s", RESULT_FILE.name)
 
-        # 启动控制器
-        controller = SniperController(
-            app_config=app_cfg,
-            tf_config=tf_cfg,
-            service=oci_service,
-            notifier=composite_notifier
-        )
-        controller.run()
+    try:
+        return Sniper(args, tf, api, tg).run()
+    except ServiceError as e:  # dry-run 校验 / 获取可用域失败
+        log.error("OCI 调用失败: %s %s: %s", e.status, e.code, e.message)
+        return 1
 
-    except OciSniperError as e:
-        logging.error(f"程序初始化/运行失败: {e}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        # 捕捉在初始化阶段就按 Ctrl+C 的极端情况
-        logging.info("进程被强制终止。")
-        sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
